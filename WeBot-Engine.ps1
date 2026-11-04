@@ -4815,7 +4815,7 @@ function Show-Banner {
     param($CountDown = $null)
     Clear-Host
     Show-WebotLogo
-    Write-Host "  🤖 微信 AI 助手 · WEBOT v1.0" -ForegroundColor Cyan -NoNewline
+    Write-Host "  🤖 微信 AI 助手 · WEBOT v1.0.0" -ForegroundColor Cyan -NoNewline
     Write-Host "   WeChat Copilot" -ForegroundColor DarkGray
 
     if (Test-Path -LiteralPath $CONFIG_FILE) {
