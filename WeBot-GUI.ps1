@@ -1,4 +1,4 @@
-﻿<#
+<#
     WeBot 图形界面
     以 "WeBot-Engine.ps1 -Gui" 启动后台引擎，解析其输出协议显示日志与状态；
     提供配置编辑（替代控制台向导）、截图区域校准、记忆与历史查看、托盘通知。
@@ -77,6 +77,17 @@ public class WeBotEngineProcess {
 }
 '@
 if (-not ([System.Management.Automation.PSTypeName]'WeBotEngineProcess').Type) { Add-Type -TypeDefinition $engine_code }
+if (-not ([System.Management.Automation.PSTypeName]'WeBotNative').Type) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class WeBotNative {
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+    // 直接把竖向滚动条拉到底，不依赖光标位置，避免 ScrollToCaret 在末尾空行处来回抖动。
+    public static void ScrollToBottom(IntPtr hWnd) { SendMessage(hWnd, 0x0115 /* WM_VSCROLL */, (IntPtr)7 /* SB_BOTTOM */, IntPtr.Zero); }
+}
+'@
+}
 
 # DPI 感知必须在任何 GDI/窗口操作（包括枚举字体）之前设置。
 [void][WeBotEngineProcess]::SetProcessDPIAware()
@@ -663,6 +674,8 @@ function Add-LogText([string]$text, [string]$color = 'Default', [bool]$newline =
     $rtb.SelectionLength = 0
     $rtb.SelectionColor = $col
     if ($newline) { $rtb.AppendText($text + "`n"); $S.LogLines++ } else { $rtb.AppendText($text) }
+    # 标记“确实写入了日志”，Invoke-Pump 只在这种情况下自动滚动（状态心跳不算）。
+    $script:LogWritten = $true
 
     # 超过 4000 行时裁掉最早的 1000 行。
     if ($S.LogLines -gt 4000) {
@@ -913,7 +926,7 @@ function Invoke-EngineExit($proc) {
 }
 
 function Invoke-Pump {
-    $wroteLog = $false
+    $script:LogWritten = $false
     foreach ($src in @('Engine', 'Calib')) {
         $proc = $S[$src]
         if (-not $proc) { continue }
@@ -923,10 +936,9 @@ function Invoke-Pump {
             Invoke-EngineLine $line $src
             $n++
         }
-        if ($n -gt 0) { $wroteLog = $true }
         if ($n -lt 500 -and $proc.HasExited -and [object]::ReferenceEquals($S[$src], $proc)) {
             $proc.FinishExit()
-            while ($proc.TryDequeue([ref]$line)) { Invoke-EngineLine $line $src; $wroteLog = $true }
+            while ($proc.TryDequeue([ref]$line)) { Invoke-EngineLine $line $src }
             if ($src -eq 'Engine') { Invoke-EngineExit $proc }
             else {
                 $code = $proc.ExitCode
@@ -943,7 +955,7 @@ function Invoke-Pump {
             }
         }
     }
-    if ($wroteLog -and $script:ChkAutoScroll.Checked) { $script:LogBox.ScrollToCaret() }
+    if ($script:LogWritten -and $script:ChkAutoScroll.Checked) { [WeBotNative]::ScrollToBottom($script:LogBox.Handle) }
 
     if ($S.Phase -eq 'Stopping' -and (Get-Date) -gt $S.StopDeadline -and (Test-EngineRunning)) {
         Add-GuiNote '引擎未在 10 秒内退出，已强制结束。' 'Yellow'
