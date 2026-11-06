@@ -1,19 +1,48 @@
-# 本机配置，可能包含 API Key
+
+# ==========================================
+# WeBot - Git Ignore
+# Windows PowerShell / WinForms
+# ==========================================
+
+# 本机配置（可能包含 API Key）
 /config.json
 
-# 聊天记录与记忆
+# 聊天记录与记忆（敏感数据）
 /chat_history.json
+/chat_history.json.bak_*
 /summary.txt
 
-# 运行日志与用量
+# 主动消息运行状态
+/proactive_state.json
+
+# 运行日志与 Token 用量
 /logs/
 /usage/
+*.log
 
-# 本地环境与临时文件
+# 本地环境变量
 .env
 .env.*
 !.env.example
+
+# 临时文件与备份
 *.tmp
+*.temp
 *.bak
+*.bak.*
+*.swp
+*.swo
+*~
+
+# Windows 系统文件
 Thumbs.db
 Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+# PowerShell 编辑器缓存（可选）
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+.idea/
