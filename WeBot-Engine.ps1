@@ -256,6 +256,158 @@ catch {
     Write-Host "⚠️ 光标闪烁检测组件加载失败，相关检测将被跳过：$($_.Exception.Message)" -ForegroundColor DarkYellow
 }
 
+# 动态区域（动图表情、视频等）检测：找出多帧中反复变化的区域，计算 hash 时把这些区域遮掉。
+# 矩形统一为 [X, Y, W, H]（裁切图坐标）。
+$dyn_code = @"
+using System;
+using System.Collections.Generic;
+using System.Security.Cryptography;
+public static class DynUtil {
+    // 遮罩矩形内像素清零后计算 SHA256。
+    public static string MaskedHash(byte[] px, int width, int height, int stride, List<int[]> rects) {
+        byte[] buf = px;
+        if (rects != null && rects.Count > 0) {
+            buf = (byte[])px.Clone();
+            foreach (int[] r in rects) {
+                int x0 = Math.Max(0, r[0]), y0 = Math.Max(0, r[1]);
+                int x1 = Math.Min(width, r[0] + r[2]), y1 = Math.Min(height, r[1] + r[3]);
+                if (x1 <= x0 || y1 <= y0) continue;
+                for (int y = y0; y < y1; y++) Array.Clear(buf, y * stride + x0 * 4, (x1 - x0) * 4);
+            }
+        }
+        using (SHA256 sha = SHA256.Create()) { return BitConverter.ToString(sha.ComputeHash(buf)); }
+    }
+
+    // 多帧差分：只保留至少变化 minToggles 次的连通区域（一次性变化如新消息、滚动不算），外扩 pad 后合并。
+    public static List<int[]> FindVolatileBoxes(List<byte[]> frames, int width, int height, int stride, int threshold, int minToggles, int pad) {
+        List<int[]> boxes = new List<int[]>();
+        if (frames == null || frames.Count < 2 || width <= 0 || height <= 0) return boxes;
+        int total = width * height;
+        int[] toggles = new int[total];
+        for (int f = 1; f < frames.Count; f++) {
+            byte[] a = frames[f - 1];
+            byte[] b = frames[f];
+            if (a.Length != b.Length) continue;
+            for (int y = 0; y < height; y++) {
+                int row = y * stride;
+                int baseIdx = y * width;
+                for (int x = 0; x < width; x++) {
+                    int i = row + x * 4;
+                    int d = Math.Abs(a[i] - b[i]) + Math.Abs(a[i + 1] - b[i + 1]) + Math.Abs(a[i + 2] - b[i + 2]);
+                    if (d > threshold) toggles[baseIdx + x]++;
+                }
+            }
+        }
+
+        bool[] seen = new bool[total];
+        Stack<int> stack = new Stack<int>();
+        int comps = 0;
+        for (int p = 0; p < total; p++) {
+            if (toggles[p] == 0 || seen[p]) continue;
+            int minX = int.MaxValue, minY = int.MaxValue, maxX = -1, maxY = -1, maxT = 0;
+            seen[p] = true;
+            stack.Push(p);
+            while (stack.Count > 0) {
+                int q = stack.Pop();
+                int qx = q % width, qy = q / width;
+                if (toggles[q] > maxT) maxT = toggles[q];
+                if (qx < minX) minX = qx;
+                if (qx > maxX) maxX = qx;
+                if (qy < minY) minY = qy;
+                if (qy > maxY) maxY = qy;
+                for (int dy = -1; dy <= 1; dy++) {
+                    int ny = qy + dy;
+                    if (ny < 0 || ny >= height) continue;
+                    for (int dx = -1; dx <= 1; dx++) {
+                        int nx = qx + dx;
+                        if (nx < 0 || nx >= width) continue;
+                        int nq = ny * width + nx;
+                        if (toggles[nq] > 0 && !seen[nq]) { seen[nq] = true; stack.Push(nq); }
+                    }
+                }
+            }
+            if (maxT >= minToggles) {
+                boxes.Add(new int[] { minX - pad, minY - pad, maxX - minX + 1 + 2 * pad, maxY - minY + 1 + 2 * pad });
+            }
+            if (++comps >= 20000) break;
+        }
+        return MergeBoxes(boxes, width, height);
+    }
+
+    // 裁到画面范围内并合并相交矩形；矩形过多时退化为一个外接矩形。
+    public static List<int[]> MergeBoxes(List<int[]> input, int width, int height) {
+        List<int[]> list = new List<int[]>();
+        if (input != null) {
+            foreach (int[] r in input) {
+                int x0 = Math.Max(0, r[0]), y0 = Math.Max(0, r[1]);
+                int x1 = Math.Min(width, r[0] + r[2]), y1 = Math.Min(height, r[1] + r[3]);
+                if (x1 > x0 && y1 > y0) list.Add(new int[] { x0, y0, x1, y1 });
+            }
+        }
+        if (list.Count > 1000) {
+            int[] all = new int[] { int.MaxValue, int.MaxValue, 0, 0 };
+            foreach (int[] c in list) {
+                all[0] = Math.Min(all[0], c[0]); all[1] = Math.Min(all[1], c[1]);
+                all[2] = Math.Max(all[2], c[2]); all[3] = Math.Max(all[3], c[3]);
+            }
+            list.Clear();
+            list.Add(all);
+        }
+        bool merged = true;
+        while (merged) {
+            merged = false;
+            for (int i = 0; i < list.Count && !merged; i++) {
+                for (int j = i + 1; j < list.Count; j++) {
+                    int[] a = list[i], b = list[j];
+                    if (a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3]) {
+                        a[0] = Math.Min(a[0], b[0]); a[1] = Math.Min(a[1], b[1]);
+                        a[2] = Math.Max(a[2], b[2]); a[3] = Math.Max(a[3], b[3]);
+                        list.RemoveAt(j);
+                        merged = true;
+                        break;
+                    }
+                }
+            }
+        }
+        List<int[]> result = new List<int[]>();
+        foreach (int[] c in list) result.Add(new int[] { c[0], c[1], c[2] - c[0], c[3] - c[1] });
+        return result;
+    }
+
+    // 统计遮罩之外差异超过阈值的像素数。
+    public static int CountDiffOutside(byte[] a, byte[] b, int width, int height, int stride, List<int[]> rects, int threshold) {
+        if (a == null || b == null || a.Length != b.Length) return int.MaxValue;
+        bool[] masked = new bool[width * height];
+        if (rects != null) {
+            foreach (int[] r in rects) {
+                int x0 = Math.Max(0, r[0]), y0 = Math.Max(0, r[1]);
+                int x1 = Math.Min(width, r[0] + r[2]), y1 = Math.Min(height, r[1] + r[3]);
+                for (int y = y0; y < y1; y++) for (int x = x0; x < x1; x++) masked[y * width + x] = true;
+            }
+        }
+        int count = 0;
+        for (int y = 0; y < height; y++) {
+            int row = y * stride;
+            for (int x = 0; x < width; x++) {
+                if (masked[y * width + x]) continue;
+                int i = row + x * 4;
+                int d = Math.Abs(a[i] - b[i]) + Math.Abs(a[i + 1] - b[i + 1]) + Math.Abs(a[i + 2] - b[i + 2]);
+                if (d > threshold) count++;
+            }
+        }
+        return count;
+    }
+}
+"@
+$script:DynUtilLoaded = $false
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'DynUtil').Type) { Add-Type -TypeDefinition $dyn_code -ErrorAction Stop }
+    $script:DynUtilLoaded = $true
+}
+catch {
+    Write-Host "⚠️ 动图检测组件加载失败，动图表情可能导致重复请求：$($_.Exception.Message)" -ForegroundColor DarkYellow
+}
+
 # 用户活动检测：读取系统空闲时间及窗口所属进程。
 $idle_code = @"
 using System;
@@ -486,7 +638,21 @@ function Clear-AIAbnormalState {
     $script:BadAiHash = ""
     $script:BadAiCount = 0
     $script:BadAiStreakCount = 0
+    $script:BadAiLastReason = ""
     $script:BadAiCooldownUntil = [DateTime]::MinValue
+}
+
+# 判断对方消息是否只是“嗯/好的/哈哈/收到/谢谢”或纯表情这类无需回应的简短应答。
+function Test-AckOnlyContent {
+    param([AllowEmptyString()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $false }
+    $t = $Text -replace '\[[^\[\]]{1,8}\]', ''            # 微信表情 [捂脸] 等
+    $t = $t -replace '[\s\p{P}\p{S}～~]', ''             # 空白、标点、符号（含 emoji 符号）
+    $t = $t -replace '[\uD800-\uDFFF‍️]', ''   # 其余 emoji（代理对）
+    $t = $t.ToLowerInvariant()
+    if ($t.Length -eq 0) { return $true }                # 只有表情/标点
+    if ($t.Length -gt 12) { return $false }
+    return ($t -match '^(嗯|恩|哦|噢|喔|哟|好|好的|好滴|好哒|好吧|行|可以|ok|okay|收到|了解|知道了|明白|明白了|懂了|哈|呵|嘿|嘻|谢谢|谢啦|多谢|感谢|晚安|拜拜|88)+$')
 }
 function Register-AIAbnormalHash {
     param(
@@ -505,6 +671,7 @@ function Register-AIAbnormalHash {
     }
 
     $script:BadAiCount++
+    $script:BadAiLastReason = $Reason
 
     # 连续异常按所有 hash 累计，避免动态画面绕过单画面重试上限。
     if ($null -eq $script:BadAiStreakCount) { $script:BadAiStreakCount = 0 }
@@ -1243,7 +1410,7 @@ function Invoke-ReplySendAndVerify {
     $verifyHash = ""
 
     try {
-        $verifyHash = (Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight).Hash
+        $verifyHash = (Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight -NoPng).Hash
 
         if ($verifyHash -eq $BeforeHash) {
             Write-Log "           ⚠️ 界面未变化，消息可能未送达（焦点是否仍在输入框？）" Yellow
@@ -2739,14 +2906,187 @@ function Find-CaretInWindow {
     return $res
 }
 
-function Get-WindowCrop {
-    # 整窗截图 → 按边距裁切 → PNG 编码 → SHA256。主循环、发送校验和各类 hash 比较共用此流程，保证 hash 可比。
-    # 返回 @{ Hash; Bytes(PNG) }；失败时抛出异常。
+# 动态区域遮罩：动图等反复变化的区域在计算 hash 时清零，避免每一帧都被当成新画面。
+# 遮罩只对相同尺寸的裁切图生效；遮罩变化后旧 hash 全部失效，需要重设基准。
+$script:DynamicMask = $null          # List[int[]]，元素 [X, Y, W, H]
+$script:DynamicMaskSize = ""
+$script:DynamicNotified = $false
+$script:FrameCache = New-Object 'System.Collections.Generic.List[object]'   # 最近几帧原始像素，按 hash 查找
+$script:FrameCacheMax = 6
+$script:BaseFrame = $null            # 与 Last_Hash 对应的原始像素
+
+function Test-DynamicGuardEnabled {
+    if (-not $script:DynUtilLoaded) { return $false }
+    if (-not $CONFIG -or -not $CONFIG.PSObject.Properties['EnableDynamicGuard']) { return $true }
+    return [bool]$CONFIG.EnableDynamicGuard
+}
+
+function Get-ActiveDynamicMask {
+    param([int]$Width, [int]$Height)
+    if ($script:DynamicMask -and $script:DynamicMask.Count -gt 0 -and $script:DynamicMaskSize -eq "${Width}x${Height}") {
+        return , $script:DynamicMask
+    }
+    return $null
+}
+
+function Clear-DynamicMask {
+    $script:DynamicMask = $null
+    $script:DynamicMaskSize = ""
+    $script:FrameCache.Clear()
+    $script:BaseFrame = $null
+}
+
+function Set-DynamicMask {
+    param($Boxes, [int]$Width, [int]$Height)
+    $list = New-Object 'System.Collections.Generic.List[int[]]'
+    foreach ($b in @($Boxes)) { if ($b) { $list.Add([int[]]$b) } }
+    $script:DynamicMask = $list
+    $script:DynamicMaskSize = "${Width}x${Height}"
+    # 旧遮罩下的 hash 已不可比。
+    $script:FrameCache.Clear()
+    $script:BaseFrame = $null
+}
+
+function Get-FrameHash {
+    param([byte[]]$Pixels, [int]$Width, [int]$Height, [int]$Stride)
+    if ($script:DynUtilLoaded) {
+        $mask = Get-ActiveDynamicMask -Width $Width -Height $Height
+        return [DynUtil]::MaskedHash($Pixels, $Width, $Height, $Stride, $mask)
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { return [System.BitConverter]::ToString($sha.ComputeHash($Pixels)) }
+    finally { $sha.Dispose() }
+}
+
+function Add-FrameCache {
+    param([string]$Hash, $Frame)
+    for ($i = $script:FrameCache.Count - 1; $i -ge 0; $i--) {
+        if ($script:FrameCache[$i].Hash -eq $Hash) { $script:FrameCache.RemoveAt($i) }
+    }
+    $script:FrameCache.Add([PSCustomObject]@{ Hash = $Hash; Frame = $Frame })
+    while ($script:FrameCache.Count -gt $script:FrameCacheMax) { $script:FrameCache.RemoveAt(0) }
+    # 基准画面单独保留，避免被连续采样挤出缓存。
+    if ($Hash -and $Hash -eq $script:Last_Hash) {
+        $script:BaseFrame = [PSCustomObject]@{ Hash = $Hash; Frame = $Frame }
+    }
+}
+
+function Get-CachedFrame {
+    param([string]$Hash)
+    if ([string]::IsNullOrWhiteSpace($Hash)) { return $null }
+    if ($script:BaseFrame -and $script:BaseFrame.Hash -eq $Hash) { return $script:BaseFrame.Frame }
+    foreach ($c in $script:FrameCache) { if ($c.Hash -eq $Hash) { return $c.Frame } }
+    return $null
+}
+
+function Test-BoxesCovered {
+    # Inner 中每个矩形都落在 Outer 某个矩形内（允许 Slack 像素误差）时返回 true。
+    param($Inner, $Outer, [int]$Slack = 8)
+    if (-not $Outer -or $Outer.Count -eq 0) { return $false }
+    foreach ($a in $Inner) {
+        $ok = $false
+        foreach ($b in $Outer) {
+            if ($a[0] -ge ($b[0] - $Slack) -and $a[1] -ge ($b[1] - $Slack) -and
+                ($a[0] + $a[2]) -le ($b[0] + $b[2] + $Slack) -and ($a[1] + $a[3]) -le ($b[1] + $b[3] + $Slack)) { $ok = $true; break }
+        }
+        if (-not $ok) { return $false }
+    }
+    return $true
+}
+
+function Resolve-DynamicChange {
+    <#
+        画面相对基准变化后连续采样约 1.4 秒，找出反复变化的区域（动图表情、视频等）。
+        DynamicOnly = $true：除动态区域外与基准一致，不是新消息；Hash 为按新遮罩计算的基准 hash。
+        DynamicOnly = $false：确有新内容；Hash / Bytes 为按（可能更新后的）遮罩重新截取的最新画面。
+        采样失败时 Hash 为空，调用方沿用原结果。
+    #>
     param(
         [Parameter(Mandatory)][IntPtr]$WindowHandle,
-        [int]$MarginLeft, [int]$MarginTop, [int]$CropWidth, [int]$CropHeight
+        [int]$MarginLeft, [int]$MarginTop, [int]$CropWidth, [int]$CropHeight,
+        $BaseFrame = $null
     )
-    $tempBmp = $null; $tempG = $null; $bitmap = $null; $g = $null; $ms = $null; $sha = $null; $hdc = [IntPtr]::Zero
+    $res = [PSCustomObject]@{ DynamicOnly = $false; Hash = ""; Bytes = $null; MaskChanged = $false }
+    $base = $BaseFrame
+
+    $frames = New-Object 'System.Collections.Generic.List[byte[]]'
+    $last = $null
+    try {
+        for ($i = 0; $i -lt 8; $i++) {
+            if ($i -gt 0) { Start-SpinnerSleep -Milliseconds 200 }
+            $c = Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight -NoPng
+            if ($last -and ($c.Frame.Width -ne $last.Width -or $c.Frame.Height -ne $last.Height)) { return $res }
+            $last = $c.Frame
+            $frames.Add($last.Pixels)
+        }
+    }
+    catch {
+        Write-AppLog "动态区域采样失败：$($_.Exception.Message)" "DEBUG"
+        return $res
+    }
+
+    $w = $last.Width; $h = $last.Height; $stride = $last.Stride
+    $fresh = [DynUtil]::FindVolatileBoxes($frames, $w, $h, $stride, 60, 2, 8)
+    $frames.Clear()
+
+    $area = 0
+    foreach ($b in $fresh) { $area += [long]$b[2] * $b[3] }
+    $ratio = $area / [double]([Math]::Max(1, $w * $h))
+    if ($fresh.Count -gt 0 -and $ratio -gt 0.5) {
+        Write-AppLog ("动态区域占截图 {0:P0}，面积过大，不当作动图处理" -f $ratio) "DEBUG"
+        $fresh = New-Object 'System.Collections.Generic.List[int[]]'
+    }
+
+    $old = Get-ActiveDynamicMask -Width $w -Height $h
+
+    # 除动态区域外与基准一致：只是动图在动。
+    if ($base -and $fresh.Count -gt 0 -and $base.Width -eq $w -and $base.Height -eq $h) {
+        $combined = New-Object 'System.Collections.Generic.List[int[]]'
+        if ($old) { foreach ($b in $old) { $combined.Add($b) } }
+        foreach ($b in $fresh) { $combined.Add($b) }
+        $union = [DynUtil]::MergeBoxes($combined, $w, $h)
+        $diff = [DynUtil]::CountDiffOutside($base.Pixels, $last.Pixels, $w, $h, $stride, $union, 30)
+        if ($diff -le 64) {
+            Set-DynamicMask -Boxes $union -Width $w -Height $h
+            $res.DynamicOnly = $true
+            $res.MaskChanged = $true
+            $res.Hash = Get-FrameHash -Pixels $last.Pixels -Width $w -Height $h -Stride $stride
+            Add-FrameCache -Hash $res.Hash -Frame $last
+            $script:BaseFrame = [PSCustomObject]@{ Hash = $res.Hash; Frame = $last }
+            Write-AppLog ("动态区域防护：变化只出现在 {0} 处持续变化的区域内（多半是动图表情），不当作新消息 → 遮罩区域={1:P1}, 区域外差异像素={2}, Hash={3}" -f $union.Count, $ratio, $diff, $res.Hash) "INFO"
+            return $res
+        }
+        Write-AppLog "动态区域防护：动态区域外仍有 $diff 个像素与基准不同，按新消息处理" "DEBUG"
+    }
+
+    # 确有新内容：动态区域位置可能随滚动变化，按本次采样更新遮罩。
+    if ($fresh.Count -gt 0 -and -not (Test-BoxesCovered -Inner $fresh -Outer $old)) {
+        Set-DynamicMask -Boxes $fresh -Width $w -Height $h
+        $res.MaskChanged = $true
+        Write-AppLog ("动态区域防护：检测到 {0} 处持续变化的区域（占截图 {1:P1}），已从画面比较中排除" -f $fresh.Count, $ratio) "INFO"
+    }
+
+    try {
+        $c = Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight
+        $res.Hash = $c.Hash
+        $res.Bytes = $c.Bytes
+    }
+    catch {
+        Write-AppLog "动态区域采样后重新截图失败：$($_.Exception.Message)" "DEBUG"
+    }
+    return $res
+}
+
+function Get-WindowCrop {
+    # 整窗截图 → 按边距裁切 → 原始像素（遮掉动态区域）→ SHA256；需要时另做 PNG 编码供模型识别。
+    # 主循环、发送校验和各类 hash 比较共用此流程，保证 hash 可比。
+    # 返回 @{ Hash; Bytes(PNG，-NoPng 时为空); Frame(原始像素) }；失败时抛出异常。
+    param(
+        [Parameter(Mandatory)][IntPtr]$WindowHandle,
+        [int]$MarginLeft, [int]$MarginTop, [int]$CropWidth, [int]$CropHeight,
+        [switch]$NoPng
+    )
+    $tempBmp = $null; $tempG = $null; $bitmap = $null; $g = $null; $ms = $null; $data = $null; $hdc = [IntPtr]::Zero
     try {
         $rect = New-Object WinUtil+RECT
         if (-not [WinUtil]::GetWindowRect($WindowHandle, [ref]$rect)) { throw "无法获取微信窗口尺寸" }
@@ -2760,23 +3100,40 @@ function Get-WindowCrop {
             if ($hdc -ne [IntPtr]::Zero) { $tempG.ReleaseHdc($hdc); $hdc = [IntPtr]::Zero }
         }
 
-        $bitmap = New-Object System.Drawing.Bitmap($CropWidth, $CropHeight)
+        $bitmap = New-Object System.Drawing.Bitmap($CropWidth, $CropHeight, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
         $g = [System.Drawing.Graphics]::FromImage($bitmap)
         $g.DrawImage($tempBmp, 0, 0,
             (New-Object System.Drawing.Rectangle($MarginLeft, $MarginTop, $CropWidth, $CropHeight)),
             [System.Drawing.GraphicsUnit]::Pixel)
+        $g.Dispose(); $g = $null
 
-        $ms = New-Object System.IO.MemoryStream
-        $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-        $bytes = $ms.ToArray()
-        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $data = $bitmap.LockBits(
+            (New-Object System.Drawing.Rectangle(0, 0, $CropWidth, $CropHeight)),
+            [System.Drawing.Imaging.ImageLockMode]::ReadOnly,
+            [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $stride = $data.Stride
+        $pixels = New-Object byte[] ($stride * $CropHeight)
+        [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $pixels, 0, $pixels.Length)
+        $bitmap.UnlockBits($data); $data = $null
+
+        $frame = [PSCustomObject]@{ Width = $CropWidth; Height = $CropHeight; Stride = $stride; Pixels = $pixels }
+        $hash = Get-FrameHash -Pixels $pixels -Width $CropWidth -Height $CropHeight -Stride $stride
+        Add-FrameCache -Hash $hash -Frame $frame
+
+        $bytes = $null
+        if (-not $NoPng) {
+            $ms = New-Object System.IO.MemoryStream
+            $bitmap.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+            $bytes = $ms.ToArray()
+        }
         return [PSCustomObject]@{
-            Hash  = [System.BitConverter]::ToString($sha.ComputeHash($bytes))
+            Hash  = $hash
             Bytes = $bytes
+            Frame = $frame
         }
     }
     finally {
-        if ($sha) { $sha.Dispose() }
+        if ($data -and $bitmap) { try { $bitmap.UnlockBits($data) } catch {} }
         if ($ms) { $ms.Dispose() }
         if ($g) { $g.Dispose() }
         if ($bitmap) { $bitmap.Dispose() }
@@ -2792,7 +3149,7 @@ function Get-WindowCropHash {
         [int]$MarginLeft, [int]$MarginTop, [int]$CropWidth, [int]$CropHeight
     )
     try {
-        return (Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight).Hash
+        return (Get-WindowCrop -WindowHandle $WindowHandle -MarginLeft $MarginLeft -MarginTop $MarginTop -CropWidth $CropWidth -CropHeight $CropHeight -NoPng).Hash
     }
     catch {
         return ""
@@ -4240,6 +4597,7 @@ function Show-WelcomeWizard {
         InputBoxClickRatioX      = [double]$WizardData.FocusClick.RatioX         # 点击点横向位置（占窗口宽度比例）
         InputBoxOffsetFromBottom = [int]$WizardData.FocusClick.OffsetFromBottom  # 点击点距窗口底部像素
         EnableBlinkGuard         = $true       # 用 hash 回跳规则过滤闪烁
+        EnableDynamicGuard       = $true       # 忽略动图表情等持续变化的区域
         AbortOnScreenChange      = $true       # 思考期间画面变化时取消请求
         EnableForegroundWait     = $true       # 微信处于前台且近期有操作时等待
         ForegroundIdleSeconds    = 3           # 前台等待的空闲时间阈值（秒）
@@ -4509,6 +4867,7 @@ function Normalize-Config {
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'InputBoxClickRatioX' -DefaultValue 0.65) -or $changed
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'InputBoxOffsetFromBottom' -DefaultValue 50) -or $changed
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'EnableBlinkGuard' -DefaultValue $true) -or $changed
+    $changed = (Ensure-ConfigProperty -Object $Config -Name 'EnableDynamicGuard' -DefaultValue $true) -or $changed
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'AbortOnScreenChange' -DefaultValue $true) -or $changed
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'EnableUsageTracking' -DefaultValue $true) -or $changed
     $changed = (Ensure-ConfigProperty -Object $Config -Name 'EnableForegroundWait' -DefaultValue $true) -or $changed
@@ -4580,7 +4939,7 @@ function Normalize-Config {
     $booleanDefaults = @{
         BlockOnMinimized = $false; NotifyOnProblem = $true; BeepOnReply = $true
         EnableLogging = $false; LogRedactContent = $true; EnableFocusClick = $false
-        EnableBlinkGuard = $true; AbortOnScreenChange = $true; EnableUsageTracking = $true
+        EnableBlinkGuard = $true; EnableDynamicGuard = $true; AbortOnScreenChange = $true; EnableUsageTracking = $true
         EnableForegroundWait = $true; EnableReplyDelay = $false; EnableProactive = $false
     }
     foreach ($name in $booleanDefaults.Keys) {
@@ -5677,6 +6036,8 @@ while ($true) {
 
         # 尺寸稳定后重新取基准，不请求模型。
         if ($script:ResizeRebasePending) {
+            # 尺寸变化后旧的动态区域坐标失效。
+            Clear-DynamicMask
             $stableHash = Wait-CropHashStable `
                 -WindowHandle $proc.MainWindowHandle `
                 -MarginLeft $mL -MarginTop $mT -CropWidth $cW -CropHeight $cH `
@@ -5738,6 +6099,9 @@ while ($true) {
             continue
         }
 
+        # 先取出基准画面像素，避免闪烁检测的连续截图把它挤出缓存。
+        $baseFrameForDyn = Get-CachedFrame -Hash $script:Last_Hash
+
         # 变化画面短时回到基准时，按闪烁处理。
         if ((Test-BlinkGuardEnabled) -and -not [string]::IsNullOrWhiteSpace($script:Last_Hash)) {
             $isBlink = Test-CropBlinkBack `
@@ -5758,6 +6122,35 @@ while ($true) {
                 }
                 Start-SpinnerSleep -Milliseconds $CONFIG.PollingIntervalMs
                 continue
+            }
+        }
+
+        # 动图表情等持续变化的内容：连续采样找出动态区域，只是动图在动时不请求模型。
+        if (Test-DynamicGuardEnabled) {
+            $dyn = Resolve-DynamicChange `
+                -WindowHandle $proc.MainWindowHandle `
+                -MarginLeft $mL `
+                -MarginTop $mT `
+                -CropWidth $cW `
+                -CropHeight $cH `
+                -BaseFrame $baseFrameForDyn
+
+            if ($dyn.DynamicOnly) {
+                $script:Last_Hash = $dyn.Hash
+                if (-not $script:DynamicNotified) {
+                    Write-Log "[$(Get-Date -Format 'HH:mm:ss')] 🎞️ 截图区域内有动图等持续变化的内容，已自动忽略这些区域" DarkGray
+                    $script:DynamicNotified = $true
+                }
+                Start-SpinnerSleep -Milliseconds $CONFIG.PollingIntervalMs
+                continue
+            }
+            if (-not [string]::IsNullOrWhiteSpace($dyn.Hash) -and $dyn.Bytes) {
+                if ($dyn.Hash -eq $script:Last_Hash) {
+                    Start-SpinnerSleep -Milliseconds $CONFIG.PollingIntervalMs
+                    continue
+                }
+                $current_hash = $dyn.Hash
+                $imgBytes = $dyn.Bytes
             }
         }
 
@@ -5932,7 +6325,17 @@ while ($true) {
 【长期记忆】: $longMemory
 【近期对话】: $historyData
 【当前时间】: $nowTime
+
+【输出格式再次提醒】
+- 最后一条是你发的：只输出 <info>0</info>
+- 最后一条是对方发的：依次输出 <info>1</info>、<content>…</content>、<reply>…</reply>，三个标签缺一不可，且都要有闭合标签。
+- 不需要回复时，<reply> 里写 __NO_REPLY__，绝对不要留空或省略 <reply>。
 "@
+
+        # 同一画面重试时，把上次的格式错误告诉模型，避免原样再错一次。
+        if ($script:BadAiHash -eq $current_hash -and $script:BadAiCount -gt 0 -and $script:BadAiLastReason) {
+            $userText += "`n【注意】你上一次的输出不符合格式要求（$($script:BadAiLastReason)）。请严格按上面的格式重新输出。"
+        }
 
         $messages = @()
         $messages += $userText
@@ -6083,9 +6486,14 @@ while ($true) {
                 }
 
                 $reply = ""
-                $replyMatches = [regex]::Matches($answerTail, "(?is)<reply>(.*?)</reply>")
+                $replyMatches = [regex]::Matches($answerTail, "(?is)<reply\s*>(.*?)</reply\s*>")
                 if ($replyMatches.Count -gt 0) {
                     $reply = $replyMatches[$replyMatches.Count - 1].Groups[1].Value.Trim()
+                }
+                elseif ($answerTail -match '(?is)<reply\s*>(.*)$') {
+                    # 只有开标签、没写 </reply>：取到文末（截断已在前面单独拦截，这里是模型漏写闭合标签）。
+                    $reply = ($Matches[1] -replace '(?is)</?(info|content|reply)\b[^>]*>', '').Trim()
+                    $reply = ($reply -replace '(?s)\s*```\s*$', '').Trim()
                 }
 
                 $cleanReply = ""
@@ -6100,6 +6508,12 @@ while ($true) {
                 }
 
                 $noReplyToken = "__NO_REPLY__"
+
+                if ([string]::IsNullOrWhiteSpace($reply) -and (Test-AckOnlyContent $content)) {
+                    # 对方只是简短应答，模型留空/省略 reply 实际就是“不用回”，按 __NO_REPLY__ 处理，避免反复重试。
+                    Write-AppLog "AI 未给出 <reply>，但对方消息为简短应答，按无需回复处理：$(Format-LogContent $content)" "INFO"
+                    $reply = $noReplyToken
+                }
 
                 if ([string]::IsNullOrWhiteSpace($reply)) {
                     [void](Register-AIAbnormalHash `

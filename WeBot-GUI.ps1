@@ -1003,6 +1003,7 @@ $FieldDefs = @(
     @{ Tab = 'send'; Path = 'ForegroundIdleSeconds'; Kind = 'int'; Label = '空闲多少秒算离开'; Min = 1; Max = 600; Default = 3 }
     @{ Tab = 'send'; Path = 'AbortOnScreenChange'; Kind = 'bool'; Label = '思考中画面变化则重来'; Default = $true }
     @{ Tab = 'send'; Path = 'EnableBlinkGuard'; Kind = 'bool'; Label = '过滤光标闪烁'; Default = $true }
+    @{ Tab = 'send'; Path = 'EnableDynamicGuard'; Kind = 'bool'; Label = '忽略动图等动态区域'; Default = $true; Note = '对方发动图时不会反复请求 AI；检测到新画面会多等约 1.5 秒' }
     @{ Tab = 'send'; Path = 'PollingIntervalMs'; Kind = 'int'; Label = '截图间隔（毫秒）'; Min = 100; Max = 10000; Default = 530 }
     @{ Tab = 'send'; Path = 'Margins.Left'; Kind = 'int'; Label = '裁切边距 · 左'; Min = 0; Max = 5000; Default = 360; Note = '建议用「校准截图区域」拖拽设置' }
     @{ Tab = 'send'; Path = 'Margins.Right'; Kind = 'int'; Label = '裁切边距 · 右'; Min = 0; Max = 5000; Default = 30 }
@@ -1579,7 +1580,12 @@ function Import-MemoryData {
         if (Test-Path -LiteralPath $HISTORY_FILE) {
             $raw = Get-Content -LiteralPath $HISTORY_FILE -Raw -Encoding UTF8
             $items = @()
-            if (-not [string]::IsNullOrWhiteSpace($raw)) { $items = @($raw | ConvertFrom-Json) }
+            if (-not [string]::IsNullOrWhiteSpace($raw)) {
+                # PS 5.1 的 ConvertFrom-Json 会把整个 JSON 数组作为单个对象输出，
+                # 直接 @(...) 只会得到 1 个元素；先赋值再包一层才能正确展开成多条
+                $parsed = $raw | ConvertFrom-Json
+                $items = @($parsed | Where-Object { $null -ne $_ })
+            }
             [array]::Reverse($items)
             foreach ($h in $items) {
                 $user = [string]$h.user
